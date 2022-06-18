@@ -1558,6 +1558,9 @@
       # Disable lazy loading implicit imports.
       - "plotly.validators.*"
       - "plotly.validators.*.*"
+      # Maybe misplaced those here. TODO: Also make recursive dependency a thing.
+      - "plotly.layouts.*"
+      - "plotly.layouts.*.*"
 
 - module-name: "tenacity"
   anti-bloat:

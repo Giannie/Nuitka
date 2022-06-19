@@ -1,4 +1,4 @@
-#     Copyright 2022, Kay Hayen, mailto:kay.hayen@gmail.com
+#     Copyright 2021, Kay Hayen, mailto:kay.hayen@gmail.com
 #
 #     Part of "Nuitka", an optimizing Python compiler that is compatible and
 #     integrates with CPython, but also works on its own.
@@ -27,6 +27,8 @@ import marshal
 import os
 import pkgutil
 import sys
+import subprocess
+import re
 
 from nuitka import Options, SourceCodeReferences
 from nuitka.__past__ import iterItems
@@ -90,7 +92,6 @@ from nuitka.utils.SharedLibraries import (
 from nuitka.utils.Signing import addMacOSCodeSignature
 from nuitka.utils.ThreadedExecutor import ThreadPoolExecutor, waitWorkers
 from nuitka.utils.Timing import TimerReport
-from nuitka.utils.Utils import isDebianBasedLinux
 
 from .DependsExe import detectDLLsWithDependencyWalker
 
@@ -103,6 +104,44 @@ def loadCodeObjectData(precompiled_filename):
 
 
 module_names = set()
+
+import subprocess
+import re
+
+class VersionTuple:
+    def __init__(self, v_string):
+        self.vtuple = version_string_to_tuple(v_string)
+    
+    def __lt__(self, other):
+        for i in range(max([len(self.vtuple), len(other.vtuple)])):
+            try:
+                if self.vtuple[i] < other.vtuple[i]:
+                    return True
+                elif self.vtuple[i] > other.vtuple[i]:
+                    return False
+            except IndexError:
+                return len(self.vtuple) < len(other.vtuple)
+        return False
+
+def get_dll_version(path):
+    proc = subprocess.Popen(f"otool -D {path}", shell=True, stdout=subprocess.PIPE)
+    out = proc.stdout.readlines()
+    if len(out) < 2:
+        return None
+    dll_id = out[1].decode().strip()
+    proc = subprocess.Popen(f"otool -L {path}", shell=True, stdout=subprocess.PIPE)
+    out = proc.stdout.readlines()
+    for line in out:
+        line = line.decode()
+        if dll_id in line and "version" in line:
+            try:
+                version_string = re.search(r"current version (.*)\)", line).group(1)
+                return VersionTuple(version_string)
+            except AttributeError:
+                print(line)
+
+def version_string_to_tuple(v_string):
+    return tuple([int(x) for x in v_string.split(".")])
 
 
 def _detectedPrecompiledFile(filename, module_name, result, user_provided, technical):
@@ -511,46 +550,6 @@ for imp in imports:
         ]
 
     return result
-
-
-def checkFreezingModuleSet():
-    """Check the module set for troubles.
-
-    Typically Linux OS specific packages must be avoided, e.g. Debian packaging
-    does make sure the packages will not run on other OSes.
-    """
-    # Cyclic dependency
-    from nuitka import ModuleRegistry
-
-    problem_modules = OrderedSet()
-
-    if isDebianBasedLinux():
-        message = (
-            "Standard with Python package from Debian installation may not be working."
-        )
-        mnemonic = "debian-dist-packages"
-
-        def checkModulePath(module):
-            if "dist-packages" in module.getCompileTimeFilename().split("/"):
-                module_name = module.getFullName()
-
-                package_name = module_name.getTopLevelPackageName()
-
-                if package_name is not None:
-                    problem_modules.add(package_name)
-                else:
-                    problem_modules.add(module_name)
-
-    else:
-        checkModulePath = None
-
-    if checkModulePath is not None:
-        for module in ModuleRegistry.getDoneModules():
-            checkModulePath(module)
-
-    if problem_modules:
-        general.info("Using Debian packages for '%s'." % ",".join(problem_modules))
-        general.warning(message=message, mnemonic=mnemonic)
 
 
 def detectEarlyImports():
@@ -985,10 +984,10 @@ def getScanDirectories(package_name, original_dir):
         and package_name is not None
         and package_name.isBelowNamespace("win32com")
     ):
-        py_win32_dir = getPyWin32Dir()
+        pywin32_dir = getPyWin32Dir()
 
-        if py_win32_dir is not None:
-            scan_dirs.append(py_win32_dir)
+        if pywin32_dir is not None:
+            scan_dirs.append(pywin32_dir)
 
     for path_dir in os.environ["PATH"].split(";"):
         if not os.path.isdir(path_dir):
@@ -1155,7 +1154,7 @@ def _detectUsedDLLs(source_dir, standalone_entry_points, use_cache, update_cache
                 if _not_found_dlls:
                     general.warning(
                         """\
-Dependency '%s' could not be found, expect runtime issues. If this is \
+Dependency '%s' could not be found, expect runtime issues. If this is
 working with Python, report a Nuitka bug."""
                         % dll_filename
                     )
@@ -1213,6 +1212,7 @@ def _fixupBinaryDLLPathsMacOS(
     # There may be nothing to do, in case there are no DLLs.
     if not dll_map:
         return
+    
 
     had_self, rpath_map = _detectBinaryPathDLLsMacOS(
         original_dir=os.path.dirname(original_location),
@@ -1232,10 +1232,9 @@ def _fixupBinaryDLLPathsMacOS(
             # Might have been a removed duplicate, check those too.
             if original_path in duplicate_dlls.get(resolved_filename, ()):
                 break
-
         else:
             dist_path = None
-
+	
         if dist_path is None:
             inclusion_logger.sysexit(
                 """\
@@ -1310,6 +1309,30 @@ def _removeDuplicateDlls(used_dlls):
                 del used_dlls[dll_filename2]
                 removed_dlls.add(dll_filename2)
 
+                duplicate_dlls.setdefault(dll_filename1, []).append(dll_filename2)
+                duplicate_dlls.setdefault(dll_filename2, []).append(dll_filename1)
+
+                continue
+            if Utils.isMacOS():
+            # Check file versions
+                dll_version1 = get_dll_version(dll_filename1)
+                dll_version2 = get_dll_version(dll_filename2)
+                
+                if dll_version1 < dll_version2:
+                    del used_dlls[dll_filename1]
+                    removed_dlls.add(dll_filename1)
+                else:
+                    del used_dlls[dll_filename2]
+                    removed_dlls.add(dll_filename2)
+
+                if dll_name not in warned_about and dll_name not in ms_runtime_dlls:
+                    warned_about.add(dll_name)
+
+                    inclusion_logger.warning(
+                            "Conflicting DLLs for '%s' in your installation, newest file version used, hoping for the best."
+                            % dll_name
+                        )
+                solved = True
                 duplicate_dlls.setdefault(dll_filename1, []).append(dll_filename2)
                 duplicate_dlls.setdefault(dll_filename2, []).append(dll_filename1)
 
